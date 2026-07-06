@@ -401,7 +401,44 @@ const Auth = (() => {
   async function reloadUserData() {
     const user = GCState.getUser();
     if (!user) return;
-    // Re-check user still exists and not force-logged-out
+
+    // Compte serveur (Supabase) : on resynchronise depuis /api/auth/me,
+    // qui reflète les vraies données à jour (crewQuota, searchesUsed, etc.)
+    if (GCApi.getUserToken()) {
+      try {
+        const r = await GCApi.me();
+        if (r.success && r.user) {
+          const fresh = r.user;
+          let serverHistory = null, serverFavorites = null;
+          try { const rh = await GCApi.getHistory(); if (rh.success) serverHistory = rh.history; } catch {}
+          try { const rf = await GCApi.getFavorites(); if (rf.success) serverFavorites = rf.favorites; } catch {}
+          const notifications = (await GCStorage.get(NOTIF_KEY)) || [];
+          GCState.set({
+            user: fresh,
+            crewQuota: fresh.crewQuota ?? DEFAULT_CREW,
+            searchUsed: fresh.searchesUsed || 0,
+            searchHistory: serverHistory || [],
+            favorites: serverFavorites || [],
+            notifications: notifications.filter(n => n.userId === fresh.id),
+          });
+          return;
+        }
+      } catch (e) {
+        if (e && (e.status === 401 || e.status === 403)) {
+          // Session vraiment invalide côté serveur (banni / déconnexion forcée / token expiré)
+          GCApi.clearUserToken();
+          await GCStorage.removeSession(SESSION_KEY);
+          GCState.set({ user: null, isAuthenticated: false, view: 'landing' });
+          GCRouter.navigate('landing');
+          return;
+        }
+        // Erreur réseau : on garde les données actuelles en mémoire, pas de déconnexion.
+        console.warn('reloadUserData: serveur injoignable, données locales conservées.', e);
+        return;
+      }
+    }
+
+    // Mode local (pas de compte serveur) : logique historique.
     const users = await getUsers();
     const fresh = users.find(u => u.id === user.id);
     if (!fresh || fresh.banned || fresh.forceLogout) {
@@ -412,18 +449,13 @@ const Auth = (() => {
     }
     const history = (await GCStorage.get(HISTORY_KEY)) || [];
     const favorites = (await GCStorage.get(FAV_KEY)) || [];
-    let serverHistory = null, serverFavorites = null;
-    if (GCApi.getUserToken()) {
-      try { const r = await GCApi.getHistory(); if (r.success) serverHistory = r.history; } catch {}
-      try { const r = await GCApi.getFavorites(); if (r.success) serverFavorites = r.favorites; } catch {}
-    }
     const notifications = (await GCStorage.get(NOTIF_KEY)) || [];
     GCState.set({
       user: sanitize(fresh),
       crewQuota: fresh.crewQuota ?? DEFAULT_CREW,
       searchUsed: fresh.searchesUsed || 0,
-      searchHistory: serverHistory || history.filter(h => h.userId === fresh.id),
-      favorites: serverFavorites || favorites.filter(f => f.userId === fresh.id),
+      searchHistory: history.filter(h => h.userId === fresh.id),
+      favorites: favorites.filter(f => f.userId === fresh.id),
       notifications: notifications.filter(n => n.userId === fresh.id),
     });
   }
@@ -503,274 +535,4 @@ const Auth = (() => {
     let history = (await GCStorage.get(HISTORY_KEY)) || [];
     history = history.filter(h => h.userId !== userId);
     await GCStorage.set(HISTORY_KEY, history);
-    let favs = (await GCStorage.get(FAV_KEY)) || [];
-    favs = favs.filter(f => f.userId !== userId);
-    await GCStorage.set(FAV_KEY, favs);
-    await logout();
-  }
-
-  // ── 2FA (TOTP) ───────────────────────────────────────
-  async function enable2FA(userId) {
-    const users = await getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx < 0) return { error: 'Utilisateur introuvable.' };
-    if (users[idx].twoFactor) return { error: 'La 2FA est déjà activée.' };
-    const secret = GCTOTP.generateSecret();
-    users[idx].twoFactorSecret = secret;
-    users[idx].twoFactorPending = true;
-    await saveUsers(users);
-    return { success: true, secret, url: GCTOTP.getOtpauthUrl(secret, users[idx].email) };
-  }
-
-  async function confirm2FA(userId, code) {
-    const users = await getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx < 0) return { error: 'Utilisateur introuvable.' };
-    if (!users[idx].twoFactorSecret) return { error: 'Aucun secret 2FA configuré.' };
-    const valid = await GCTOTP.verify(users[idx].twoFactorSecret, code);
-    if (!valid) return { error: 'Code invalide. Vérifiez votre application.' };
-    users[idx].twoFactor = true;
-    users[idx].twoFactorPending = false;
-    await saveUsers(users);
-    return { success: true };
-  }
-
-  async function disable2FA(userId, code) {
-    const users = await getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx < 0) return { error: 'Utilisateur introuvable.' };
-    if (!users[idx].twoFactor) return { error: 'La 2FA n\'est pas activée.' };
-    const valid = await GCTOTP.verify(users[idx].twoFactorSecret, code);
-    if (!valid) return { error: 'Code invalide.' };
-    users[idx].twoFactor = false;
-    users[idx].twoFactorSecret = null;
-    users[idx].twoFactorPending = false;
-    await saveUsers(users);
-    return { success: true };
-  }
-
-  async function verifyLogin2FA(userId, code) {
-    const users = await getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx < 0 || !users[idx].twoFactor || !users[idx].twoFactorSecret) return false;
-    return await GCTOTP.verify(users[idx].twoFactorSecret, code);
-  }
-
-  async function recordSearch(userId) {
-    // Try Server API first
-    if (GCApi.getUserToken()) {
-      try {
-        const result = await GCApi.useCredit();
-        GCState.set({ searchUsed: result.searchesUsed });
-        return;
-      } catch {}
-    }
-    // localStorage fallback
-    const users = await getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx >= 0) {
-      users[idx].searchesUsed = (users[idx].searchesUsed || 0) + 1;
-      await saveUsers(users);
-    }
-    GCState.set({ searchUsed: GCState.get().searchUsed + 1 });
-  }
-
-  async function addHistory(entry) {
-    // Try Server API first
-    if (GCApi.getUserToken()) {
-      try {
-        const result = await GCApi.addHistory(entry);
-        if (result.success) {
-          GCState.set({ searchHistory: [result.entry, ...GCState.get().searchHistory].slice(0, 500) });
-          return;
-        }
-      } catch {}
-    }
-    // localStorage fallback
-    const history = (await GCStorage.get(HISTORY_KEY)) || [];
-    entry.id = 'h_' + Date.now();
-    entry.userId = GCState.get().user?.id;
-    entry.date = new Date().toISOString();
-    history.unshift(entry);
-    await GCStorage.set(HISTORY_KEY, history.slice(0, 500));
-    GCState.set({ searchHistory: [entry, ...GCState.get().searchHistory].slice(0, 500) });
-  }
-
-  async function deleteHistory(id) {
-    // Try Server API first
-    if (GCApi.getUserToken()) {
-      try {
-        await GCApi.deleteHistory(id);
-        GCState.set({ searchHistory: GCState.get().searchHistory.filter(h => h.id !== id) });
-        return;
-      } catch {}
-    }
-    // localStorage fallback
-    let history = (await GCStorage.get(HISTORY_KEY)) || [];
-    history = history.filter(h => h.id !== id);
-    await GCStorage.set(HISTORY_KEY, history);
-    GCState.set({ searchHistory: GCState.get().searchHistory.filter(h => h.id !== id) });
-  }
-
-  async function toggleFavorite(entry) {
-    // Try Server API first
-    if (GCApi.getUserToken()) {
-      try {
-        const result = await GCApi.toggleFavorite(entry);
-        if (result.success) {
-          const favs = await GCApi.getFavorites();
-          if (favs.success) GCState.set({ favorites: favs.favorites.filter(f => f.userId === GCState.get().user?.id) });
-          return result.added;
-        }
-      } catch {}
-    }
-    // localStorage fallback
-    const favs = (await GCStorage.get(FAV_KEY)) || [];
-    const userId = GCState.get().user?.id;
-    const existing = favs.findIndex(f => f.userId === userId && f.query === entry.query);
-    if (existing >= 0) {
-      favs.splice(existing, 1);
-    } else {
-      favs.push({ ...entry, userId, id: 'f_' + Date.now(), addedAt: new Date().toISOString() });
-    }
-    await GCStorage.set(FAV_KEY, favs);
-    GCState.set({ favorites: favs.filter(f => f.userId === userId) });
-    return existing < 0;
-  }
-
-  async function addNotification(type, message) {
-    const notifs = (await GCStorage.get(NOTIF_KEY)) || [];
-    const userId = GCState.get().user?.id;
-    const n = { id: 'n_' + Date.now(), userId, type, message, read: false, date: new Date().toISOString() };
-    notifs.unshift(n);
-    await GCStorage.set(NOTIF_KEY, notifs.slice(0, 200));
-    GCState.set({ notifications: [n, ...GCState.get().notifications].slice(0, 200) });
-  }
-
-  async function markNotificationsRead() {
-    const notifs = (await GCStorage.get(NOTIF_KEY)) || [];
-    const userId = GCState.get().user?.id;
-    notifs.forEach(n => { if (n.userId === userId) n.read = true; });
-    await GCStorage.set(NOTIF_KEY, notifs);
-    GCState.set({ notifications: GCState.get().notifications.map(n => ({ ...n, read: true })) });
-  }
-
-  async function applyPromoCode(code) {
-    // Try Server API first
-    if (GCApi.getUserToken()) {
-      try {
-        const result = await GCApi.applyPromo(code.trim().toUpperCase());
-        if (result.success) {
-          GCState.set({ crewQuota: result.newCrewQuota });
-          await addNotification('promo_used', `Code promo ${code.trim().toUpperCase()} activé : +${result.added} Crew`);
-          return { success: true, added: result.added, label: result.label };
-        }
-      } catch (e) {
-        if (e.status === 409) return { error: 'Ce code a déjà été utilisé.' };
-        if (e.status === 404) return { error: t('promo.invalid') };
-        if (!e.offline) console.warn('API promo apply failed, using localStorage fallback:', e);
-      }
-    }
-
-    // localStorage fallback
-    const promoCodes = (await GCStorage.get(PROMO_KEY)) || {
-      'GC-WELCOME4': { searches: 4, active: true, label: 'Bonus WhatsApp' }
-    };
-    await GCStorage.set(PROMO_KEY, promoCodes);
-    const usedCodes = (await GCStorage.get(PROMO_USED_KEY)) || {};
-    const userId = GCState.get().user?.id;
-    const upperCode = code.trim().toUpperCase();
-    const promo = promoCodes[upperCode];
-    if (!promo || !promo.active) return { error: t('promo.invalid') };
-    if (usedCodes[userId]?.includes(upperCode)) return { error: 'Ce code a déjà été utilisé.' };
-    if (!usedCodes[userId]) usedCodes[userId] = [];
-    usedCodes[userId].push(upperCode);
-    await GCStorage.set(PROMO_USED_KEY, usedCodes);
-    const state = GCState.get();
-    const newCrew = (state.crewQuota || DEFAULT_CREW) + promo.searches;
-    GCState.set({ crewQuota: newCrew });
-    const users = await getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx >= 0) { users[idx].crewQuota = newCrew; await saveUsers(users); }
-    await addNotification('promo_used', `Code promo ${upperCode} activé : +${promo.searches} Crew`);
-    return { success: true, added: promo.searches, label: promo.label };
-  }
-
-  async function initDefaultPromo() {
-    const codes = await GCStorage.get(PROMO_KEY);
-    if (!codes) {
-      await GCStorage.set(PROMO_KEY, {
-        'GC-WELCOME4': { searches: 4, active: true, label: 'Bonus WhatsApp' }
-      });
-    }
-  }
-
-  function sanitize(user) {
-    const { password, salt, ...safe } = user;
-    return safe;
-  }
-
-  function getNextMonday() {
-    const d = new Date();
-    const day = d.getDay();
-    const diff = day === 0 ? 1 : 8 - day;
-    d.setDate(d.getDate() + diff);
-    d.setHours(0, 0, 0, 0);
-    return d.toISOString();
-  }
-
-  // ── Fingerprint Admin Records ─────────────────────────
-  async function getFingerprintRecords() {
-    const users = await getUsers();
-    return users.map(u => ({
-      id: u.id,
-      username: u.username,
-      email: u.email,
-      fingerprint: u.fingerprint || 'unavailable',
-      registerIP: u.registerIP || 'unknown',
-      deviceInfo: u.deviceInfo || {},
-      loginHistory: u.loginHistory || [],
-      createdAt: u.createdAt,
-      banned: u.banned || false,
-    }));
-  }
-
-  async function getDuplicateAccounts() {
-    const users = await getUsers();
-    const fpGroups = {};
-    users.forEach(u => {
-      const fp = u.fingerprint || 'unavailable';
-      if (!fpGroups[fp]) fpGroups[fp] = [];
-      fpGroups[fp].push(u);
-    });
-    const ipGroups = {};
-    users.forEach(u => {
-      const ip = u.registerIP || 'unknown';
-      if (ip === 'unknown') return;
-      if (!ipGroups[ip]) ipGroups[ip] = [];
-      ipGroups[ip].push(u);
-    });
-    return {
-      byFingerprint: Object.entries(fpGroups)
-        .filter(([, g]) => g.length > 1)
-        .map(([fp, g]) => ({ fingerprint: fp, users: g.map(u => u.username) })),
-      byIP: Object.entries(ipGroups)
-        .filter(([, g]) => g.length > 1)
-        .map(([ip, g]) => ({ ip, users: g.map(u => u.username) })),
-    };
-  }
-
-  return {
-    register, login, logout, checkSession, updateProfile, changePassword,
-    deleteAccount, recordSearch, addHistory, deleteHistory, toggleFavorite,
-    addNotification, markNotificationsRead, applyPromoCode, initDefaultPromo,
-    validateEmail, validatePassword, legacyHashPassword, hashPasswordSHA256, generateToken, generateCode,
-    enable2FA, confirm2FA, disable2FA, verifyLogin2FA, login2FAComplete, getUsers,
-    reloadUserData, getUserHistory, getUserFavorites, getUserNotifications,
-    getFingerprintRecords, getDuplicateAccounts, adminResetPassword,
-    USERS_KEY, SESSION_KEY, HISTORY_KEY, FAV_KEY, NOTIF_KEY, PROMO_KEY, PROMO_USED_KEY,
-    DEFAULT_CREW, FORCE_LOGOUT_KEY,
-  };
-})();
-
-window.GCAuth = Auth;
+    let favs = (await GCStorage.get(F
