@@ -21,7 +21,7 @@ const Router = (() => {
       await views[viewName](container, params);
     } catch (e) {
       console.error('View render error:', e);
-      container.innerHTML = `<div class="empty-state"><div class="icon">⚠️</div><p>${window.GCI18n?.t('common.error') ?? 'Erreur'}</p></div>`;
+      container.innerHTML = `<div class="empty-state"><div class="icon">⚠️</div><p>${window.GCI18n?.t('common.error') ?? 'Erreur'}</p><p style="font-size:0.65rem;color:var(--text-muted);margin-top:8px;word-break:break-word;padding:0 16px">${(e && e.message) ? e.message.replace(/</g,'&lt;') : ''}${e && e.stack ? '<br><br>' + e.stack.split('\n').slice(0,3).join('<br>').replace(/</g,'&lt;') : ''}</p></div>`;
     }
   }
 
